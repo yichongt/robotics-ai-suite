@@ -27,6 +27,7 @@ The system enables natural language control of the robot, including:
 - Camera snapshot capture and analysis
 - Linear movement commands with closed-loop odometry control
 - Real-time visual feedback in OpenClaw UI
+- (Optional) Multi-step skill tasks that chain navigation and VLA manipulation, with a user-visible announcement before and after each step (see [5. VLA & Navigation Skills](#5-vla--navigation-skills-optional))
 
 ## Prerequisites
 
@@ -43,6 +44,7 @@ The system enables natural language control of the robot, including:
 - Intel oneAPI Base Toolkit (for XPU support)
 - Gazebo simulation environment
 - Node.js 22.19.0+ (for OpenClaw)
+- Nav2 (optional; only needed for the navigation skill tasks in section 5)
 
 ## Installation
 
@@ -625,6 +627,76 @@ journalctl --user -u openclaw-gateway.service -n 60 --no-pager | grep -E 'ROS2 t
 # Expected: Should show "ROS2 transport connected" or similar success message
 ```
 
+### 5. VLA & Navigation Skills (Optional)
+
+This optional step adds two AgenticROS skills so that OpenClaw can run multi-step tasks such as "go to the table and pick up the apple":
+
+- **Navigation skill** (`list_navigation_tasks` / `run_navigation_task`): sends a Nav2 `NavigateToPose` action goal for a named task such as `go_to_table`.
+- **VLA skill** (`list_vla_tasks` / `run_vla_task`): sends a `vla_inference_action/action/VLAInference` goal for a named task such as `pick_apple`.
+
+Both skills live in the `agenticros-vla-skill` repository, which also contains the AgenticROS OpenClaw plugin (`packages/agenticros`) that loads them. Task names, actions and announcement texts are configured under `plugins.entries.agenticros.config.skills` in `~/.openclaw/openclaw.json`; see `packages/agenticros-skill-vla/README.md` and `packages/agenticros-skill-navigation/README.md` in that repository for the config contract.
+
+#### Get the Skills Repository
+
+```bash
+cd ~/robotics-ai-suite/src/pipelines/openclaw-agenticros-demo
+git clone https://github.com/intel-innersource/frameworks.robotics.embodied-intelligence.agenticros.git agenticros-vla-skill
+cd agenticros-vla-skill
+pnpm install
+pnpm build
+```
+
+#### Switch the OpenClaw Plugin to the Skills Repository
+
+The plugin from the `agenticros` submodule does not include the skill tools, and OpenClaw silently drops tools that a plugin does not declare. Make OpenClaw load the plugin from the skills repository instead. `setup_gateway_plugin.sh` (section 4) adds the submodule plugin to `plugins.load.paths`; remove that entry so that only one `agenticros` plugin path remains:
+
+```json
+{
+  "plugins": {
+    "load": {
+      "paths": ["~/robotics-ai-suite/src/pipelines/openclaw-agenticros-demo/agenticros-vla-skill/packages/agenticros"]
+    }
+  }
+}
+```
+
+#### Start the Stack
+
+```bash
+cd ~/robotics-ai-suite/src/pipelines/openclaw-agenticros-demo/agenticros-vla-skill
+./scripts/start_openclaw_agenticros_stack.sh --vla-ws <path-to-vla-ros-workspace>
+```
+
+The script can be re-run safely. It:
+1. Sets the AgenticROS plugin transport to rosbridge `ws://localhost:9090`
+2. Builds the two skill packages if their `dist/` is missing
+3. Writes `skillPaths` and the default task bindings (navigation `navigate_to_pose` / `go_to_table`, VLA `pick_apple`) without overwriting tasks you have customized
+4. Enables `skills.mission.announcementProtocol`, which injects the "announce every step" rule into each turn
+5. Limits the main agent to the robot tools plus `tts` (`minimal` + `alsoAllow`), only if the agent still uses the default tool profile
+6. Restarts the OpenClaw gateway (only if the config changed or it is unhealthy) and rosbridge
+
+**📌 Important Notes:**
+- Always pass `--vla-ws` with your own VLA ROS workspace (the directory that contains `install/setup.bash` and provides `vla_inference_action`); the built-in default is machine-specific. If the workspace is missing, all VLA steps are skipped and the stack starts with the navigation skill only.
+- Use `--start-vla-cmd "<command>"` to start your VLA action server (`/vla_inference`) together with the stack, or start it yourself.
+- Navigation tasks use `nav2_msgs/action/NavigateToPose` on `/navigate_to_pose` by default. A Nav2 action server must be running there; otherwise the script prints a warning and navigation tasks fail.
+
+#### Trim the OpenClaw Prompt (Recommended)
+
+By default OpenClaw exposes many general-purpose tools and a long workspace prompt, which wastes context in this demo. The trim script reduces both (dry-run by default):
+
+```bash
+cd ~/robotics-ai-suite/src/pipelines/openclaw-agenticros-demo/agenticros-vla-skill
+./scripts/apply_openclaw_trim.sh                      # dry-run, prints the plan
+./scripts/apply_openclaw_trim.sh --apply --restart
+```
+
+It:
+- limits the main agent's visible tools to the robot tools plus `tts`/`asr`/`transcribe` (`minimal` + `alsoAllow`),
+- replaces `~/openclaw-workspace/AGENTS.md` with the robot multi-step task protocol only, and moves `MEMORY.md` and `memory/*.md` out of the prompt context (originals are backed up under `~/openclaw-workspace-archive-<date>/`),
+- enables the announcement protocol, and leaves the model/provider configuration untouched.
+
+Recorded effect: visible tools 43 → 17, first-turn input about 24.2K → 10.4K tokens. See `docs/openclaw-prompt-trim.md` and `docs/prompt-trimming-2026-08-11.md` in the skills repository for details and how to roll back.
+
 
 ## Running the Demo
 
@@ -785,6 +857,30 @@ Rotate the robot 90 degrees clockwise
   <img src="README.assets/rotate_robot_validation.png" alt="Robot Rotation Validation"><br>
   <em>JAKA Kargo robot executing 90-degree clockwise rotation with angular velocity control</em>
 </p>
+
+#### Multi-step Skill Tasks (Optional)
+
+Requires section 5, a running Nav2 action server and a running VLA action server.
+
+```text
+Go to the table and pick up the apple
+```
+
+**Expected behavior:**
+1. ✅ The agent calls `list_navigation_tasks` and `list_vla_tasks` once to confirm that every step exists
+2. ✅ For each step, the agent first sends the task's announcement text as a standalone message, then calls `run_navigation_task` / `run_vla_task` with the same text
+3. ✅ After a step succeeds, the agent sends the task's completion announcement; on failure or timeout it stops and does not continue with later steps
+
+With the default task bindings the chat shows:
+
+```text
+Start navigating to the table
+Arrived at the table
+Start picking up the apple
+Apple pick task completed
+```
+
+The announcement texts come from the task configuration (`skills.navigation.tasks` / `skills.vla.tasks`), so they match whatever you configured.
 
 ## Troubleshooting
 
